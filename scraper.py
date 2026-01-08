@@ -14,6 +14,8 @@ class FlareSolverrClient:
     def __init__(self, base_url="http://localhost:8191/v1"):
         self.base_url = base_url
         self.session_id = None
+        self.last_cookies = None
+        self.last_user_agent = None
 
     def create_session(self):
         """Creates a new browser session in FlareSolverr."""
@@ -49,6 +51,8 @@ class FlareSolverrClient:
             logging.info(f"Destroying session: {self.session_id}")
             requests.post(self.base_url, json=payload)
             self.session_id = None
+            self.last_cookies = None
+            self.last_user_agent = None
         except requests.exceptions.RequestException as e:
             logging.error(f"Error destroying session: {e}")
 
@@ -66,13 +70,17 @@ class FlareSolverrClient:
         }
         
         try:
-            logging.info(f"Scraping URL: {url}")
+            logging.info(f"Scraping URL (FlareSolverr): {url}")
             response = requests.post(self.base_url, json=payload)
             response.raise_for_status()
             data = response.json()
             
             if data.get('status') == 'ok':
-                return data.get('solution', {}).get('response') # Returns HTML
+                solution = data.get('solution', {})
+                # Capture session data for hybrid usage
+                self.last_cookies = {c['name']: c['value'] for c in solution.get('cookies', [])}
+                self.last_user_agent = solution.get('userAgent')
+                return solution.get('response') # Returns HTML
             else:
                 logging.error(f"Error scraping page: {data}")
                 return None
@@ -81,11 +89,21 @@ class FlareSolverrClient:
             logging.error(f"Request failed: {e}")
             return None
 
+    def get_session_data(self):
+        """Returns the cookies and user-agent from the last successful request."""
+        if self.last_cookies and self.last_user_agent:
+            return {
+                "cookies": self.last_cookies,
+                "user_agent": self.last_user_agent
+            }
+        return None
+
 class CamelScraper:
     BASE_URL = "https://camelcamelcamel.com"
 
     def __init__(self):
         self.client = FlareSolverrClient()
+        self.session = None # Standard requests session
 
     def _parse_search_results(self, html):
         """Parses search results HTML and extracts product data."""
@@ -157,7 +175,7 @@ class CamelScraper:
         all_products = []
         page = 1
         
-        # Fetch first page to determine max pages
+        # Step 1: Use FlareSolverr for the first page to bypass Cloudflare
         first_url = f"{self.BASE_URL}/search?sq={requests.utils.quote(query)}"
         html = self.client.get_content(first_url)
         
@@ -165,6 +183,18 @@ class CamelScraper:
             logging.error("Failed to fetch first page.")
             return all_products
             
+        # Step 2: Initialize standard requests session with credentials from FlareSolverr
+        session_data = self.client.get_session_data()
+        if session_data:
+            self.session = requests.Session()
+            self.session.cookies.update(session_data['cookies'])
+            self.session.headers.update({
+                'User-Agent': session_data['user_agent']
+            })
+            logging.info("Initialized hybrid session with FlareSolverr credentials.")
+        else:
+            logging.warning("Could not retrieve session credentials. Falling back to FlareSolverr for all requests.")
+
         # Determine max pages available
         available_max_page = self._get_max_page(html)
         if max_pages is None:
@@ -179,10 +209,25 @@ class CamelScraper:
         all_products.extend(products)
         logging.info(f"Page 1: Found {len(products)} products.")
         
-        # Loop through remaining pages
+        # Step 3: Loop through remaining pages using standard requests (if session active)
         for page in range(2, max_pages + 1):
             url = f"{self.BASE_URL}/search?sq={requests.utils.quote(query)}&p={page}"
-            html = self.client.get_content(url)
+            
+            html = None
+            if self.session:
+                try:
+                    logging.info(f"Scraping URL (Direct): {url}")
+                    response = self.session.get(url, timeout=30)
+                    if response.status_code == 200:
+                        html = response.text
+                    else:
+                        logging.warning(f"Direct request failed (Status {response.status_code}). Falling back to FlareSolverr.")
+                except Exception as e:
+                    logging.warning(f"Direct request error: {e}. Falling back to FlareSolverr.")
+            
+            # Fallback to FlareSolverr if direct request failed or session not set
+            if not html:
+                html = self.client.get_content(url)
             
             if not html:
                 logging.warning(f"Failed to fetch page {page}. Stopping.")
@@ -246,10 +291,10 @@ class CamelScraper:
 
     def save_results(self, query, products):
         """Saves the results to a JSON file in a folder named after the query."""
-        # Sanitize folder name
         safe_query = re.sub(r'[^\w\s-]', '', query).strip().replace(' ', '_')
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        folder_name = f"{safe_query}_{timestamp}"
+        # Save into a 'results' subdirectory
+        folder_name = os.path.join("results", f"{safe_query}_{timestamp}")
         
         os.makedirs(folder_name, exist_ok=True)
         
